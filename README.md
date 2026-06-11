@@ -14,22 +14,38 @@
 # System Design
 
 ### Requirements and Constraints:
+
+  Constraints:
+  - Scaling to real life might be troublesome as the data in the game might not be accuarate to real life.
+  - Training is limited to the Hardware i currently have.
+  - Latency
+  - Extracting Game Data accurately.
+  - AI might get used only to the game's images so running it in other games/real life might be difficult.
+  - Running the AI with telemetry only will restrain the drone and make it only hover mostly. *(Possible solution: Computer Vision on Virtual LIDAR)*
+    
+    *(Must find solutions to these problems)*
   
   Functional Requirements: 
-  
-  - Users can open and run the application to test the AI.
-  - Users can stop the AI at any point in time.
   - Drone must be fully controlled by AI while AI is running.
   - AI must act really fast and press buttons in ms. (low latency)
   - Mod should provide details in console about flight data, drone status, etc...
-  - The mod must provide accuarate data to the AI.
-
-   *(Further down the line I should scale this to be seen by the user in the application)*
+  - The mod must provide accurate data to the AI.
+   
+ > Future Scope (If this repo gains traction): Create an application that can be downloaded by anyone. User presses a start button and the game starts, picks a random map and the AI starts flying. Real time game  telemetrics are simplified and shown by the application.
 
   Non-Functional Requirements:
   - Scale from the game world to real life.
 
- High-Level Arhitecture:
+### High-Level Arhitecture:
+ 
+![Diagram](https://github.com/crx-21/Virtual-AI-Drone/blob/0abbf03eaf6b0347b870f15d6764bd5445f334e2/images/Diagram.png)
+
+### Core Architectural Layers:
+
+1. Telemetry Capture Mod: Captures the data from the game and lends it to the python listener.
+2. Python Listener: Interprets the data and works hand-in-hand with the AI so it can make decisions.
+3. AI Brain: Controls the drone based on the received data from the python listener and takes actions.
+
 
 
 
