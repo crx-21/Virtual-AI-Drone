@@ -1,8 +1,33 @@
-local lastVelocity = 0
+-- ===================== CONFIG (tune these) =====================
+local GYRO_MODE         = "derived"  -- "derived" (consistent, from angle changes) or "physics" (mesh component).
+                                     -- Status line prints BOTH so you can compare before switching.
+local HIT_IMPULSE_MIN   = 0          -- min NormalImpulse magnitude to count a hit as a crash.
+                                     -- Watch the "[TelemetryCrX] HIT" prints, then raise it above floor-scrape values.
+local CRASH_COOLDOWN    = 0.5        -- seconds; one crash fires several hits, count it once
+local JUMP_MIN          = 300        -- units; extra slack before a position change counts as a teleport/reset
+local FALLBACK_DECEL    = 14000      -- units/s^2, used only until the first real hit is seen
+local FALLBACK_MIN_SPEED = 300
+local FALLBACK_ANG_SPIKE_3D = 300    -- deg/s; extra confirmation required ONLY in 3D mode (IS3D? = true),
+                                     -- so hard braking there isn't a crash. Angle/acro use the plain speed-drop rule.
+                                     -- Set to 0 to disable it and use the plain rule everywhere.
+-- ===============================================================
 
--- Gyro Tracking (Virtual IMU) Variables
+local BP = "/Game/BASE_FPV_LOUIS/LouisFPV.LouisFPV_C:"
+
+local lastVelocity = 0
 local lastPitch, lastYaw, lastRoll = nil, nil, nil
-local X_rot, Y_rot, Z_rot = 0, 0, 0
+local lastLoc = nil
+local lastTime = nil
+local X_rot, Y_rot, Z_rot = 0, 0, 0      -- Roll / Pitch / Yaw rates in deg/s (selected by GYRO_MODE)
+local physX, physY, physZ = nil, nil, nil -- raw physics reading, for comparison only
+local gyroSource = "none"
+
+-- Event state
+local crashFlag = false
+local resetFlag = nil
+local hookEverFired = false
+local lastCrashTime = -math.huge
+local crashCount, resetCount = 0, 0
 
 local function findDrone()
     local Drones = FindAllOf("LouisFPV_C")
@@ -12,7 +37,6 @@ local function findDrone()
     return drone
 end
 
--- Helper to handle angle wrapping seamlessly when flipping past -180/180 degrees
 local function getAngleDelta(current, last)
     local delta = current - last
     if delta > 180 then delta = delta - 360
@@ -20,40 +44,165 @@ local function getAngleDelta(current, last)
     return delta
 end
 
--- Detection loop: runs every 25ms (40x per second, fast enough to catch crashes)
+-- Safe read of a Blueprint property (names with spaces / '?' work via indexing)
+local function readProp(obj, name)
+    local ok, v = pcall(function() return obj[name] end)
+    if ok then return v end
+    return nil
+end
+
+-- Angular velocity from the drone's SkeletalMeshComponent (the property named "drone"),
+-- NOT the actor and not necessarily RootComponent.
+local function getPhysicsAngularVelocity(drone)
+    local ok, ang = pcall(function()
+        local mesh = drone.drone
+        if not mesh or not mesh:IsValid() then return nil end
+        return mesh:GetPhysicsAngularVelocityInDegrees(FName("None"))
+    end)
+    if ok and ang then
+        return ang.X or 0, ang.Y or 0, ang.Z or 0
+    end
+    return nil
+end
+
+local function registerCrash(now, reason)
+    if now - lastCrashTime < CRASH_COOLDOWN then return end
+    lastCrashTime = now
+    crashCount = crashCount + 1
+    print(string.format("[TelemetryCrX] CRASH #%d (%s)", crashCount, reason))
+end
+
+-- ---------------------------------------------------------------
+-- Hook 1: the game's own collision event (component OnHit bound event on the mesh).
+-- Params: HitComponent, OtherActor, OtherComp, NormalImpulse, Hit
+-- ---------------------------------------------------------------
+local okHit, errHit = pcall(function()
+    RegisterHook(BP .. "BndEvt__Drone_K2Node_ComponentBoundEvent_0_ComponentHitSignature__DelegateSignature",
+        function(self, HitComponent, OtherActor, OtherComp, NormalImpulse, Hit)
+            local ok, err = pcall(function()
+                local imp = NormalImpulse:get()
+                local mag = math.sqrt((imp.X or 0)^2 + (imp.Y or 0)^2 + (imp.Z or 0)^2)
+
+                local otherName = "?"
+                pcall(function()
+                    local a = OtherActor:get()
+                    if a and a:IsValid() then otherName = a:GetFullName() end
+                end)
+
+                hookEverFired = true
+                print(string.format("[TelemetryCrX] HIT impulse=%.1f (min %.1f) other=%s", mag, HIT_IMPULSE_MIN, otherName))
+
+                if mag > HIT_IMPULSE_MIN then
+                    crashFlag = true
+                end
+            end)
+            if not ok then print("[TelemetryCrX] Hit callback error: " .. tostring(err)) end
+        end)
+end)
+print(okHit and "[TelemetryCrX] Hit hook registered"
+      or ("[TelemetryCrX] Hit hook FAILED (fallback only): " .. tostring(errHit)))
+
+-- ---------------------------------------------------------------
+-- Hook 2: the game's reset functions (marks episode boundaries / teleports)
+-- ---------------------------------------------------------------
+for _, fname in ipairs({ "Reset Quad", "full reset" }) do
+    local ok, err = pcall(function()
+        RegisterHook(BP .. fname, function(self)
+            resetFlag = fname
+        end)
+    end)
+    print(ok and ("[TelemetryCrX] Reset hook registered: " .. fname)
+          or ("[TelemetryCrX] Reset hook FAILED for '" .. fname .. "': " .. tostring(err)))
+end
+
+-- Clears history so a teleport doesn't produce huge fake angular rates / crashes
+local function clearHistory()
+    lastPitch, lastYaw, lastRoll = nil, nil, nil
+    lastLoc = nil
+    lastVelocity = 0
+    lastTime = nil
+    X_rot, Y_rot, Z_rot = 0, 0, 0
+end
+
+-- Detection loop: ~25ms
 local function detectionLoop()
     ExecuteWithDelay(25, function()
         local drone = findDrone()
         if drone then
+            local now = os.clock()
+
+            if resetFlag then
+                resetCount = resetCount + 1
+                print(string.format("[TelemetryCrX] RESET #%d (%s)", resetCount, resetFlag))
+                resetFlag = nil
+                crashFlag = false
+                clearHistory()
+            end
+
+            local dt = lastTime and (now - lastTime) or nil
+            lastTime = now
+
             local vel = drone:GetVelocity()
             local currentSpeed = math.sqrt(vel.X^2 + vel.Y^2 + vel.Z^2)
 
-            -- Use deceleration instead of absolute speed
-            -- if you lost 350+ units of speed in one 25ms window, that's a crash
-            local decel = lastVelocity - currentSpeed
-            local isCrash = (lastVelocity > 300 and decel > 350)
-
-            if isCrash then
-                print(string.format("[TelemetryCrX] CRASH! %.2f -> %.2f (lost %.2f)",
-                    lastVelocity, currentSpeed, decel))
+            -- Teleport guard (catches resets the hooks missed)
+            local loc = drone:K2_GetActorLocation()
+            if lastLoc and dt and dt > 0 then
+                local dx, dy, dz = loc.X - lastLoc.X, loc.Y - lastLoc.Y, loc.Z - lastLoc.Z
+                local dist = math.sqrt(dx*dx + dy*dy + dz*dz)
+                if dist > currentSpeed * dt * 3 + JUMP_MIN then
+                    print(string.format("[TelemetryCrX] TELEPORT detected (%.0f units in %.0f ms)", dist, dt * 1000))
+                    clearHistory()
+                    lastLoc = { X = loc.X, Y = loc.Y, Z = loc.Z }
+                    detectionLoop()
+                    return
+                end
             end
+            lastLoc = { X = loc.X, Y = loc.Y, Z = loc.Z }
 
-            lastVelocity = currentSpeed
-
-            -- Angular Velocity
+            -- Orientation
             local VectorRotate = drone:K2_GetActorRotation()
             local Pitch = VectorRotate.Pitch or 0
             local Yaw = VectorRotate.Yaw or 0
             local Roll = VectorRotate.Roll or 0
 
-            -- We calculate Angular Velocity until I find a way to actually get the actual Velocity.
-            if lastPitch and lastYaw and lastRoll then
-                -- Multiplying the change by 40 turns degrees-per-25ms into true Degrees Per Second (DPS)
-                Y_rot = getAngleDelta(Pitch, lastPitch) * 40 -- Pitch Velocity
-                Z_rot = getAngleDelta(Yaw, lastYaw) * 40     -- Yaw Velocity
-                X_rot = getAngleDelta(Roll, lastRoll) * 40   -- Roll Velocity
+            -- Derived rates using real elapsed time
+            local dRoll, dPitch, dYaw = nil, nil, nil
+            if lastPitch and lastYaw and lastRoll and dt and dt > 0 then
+                dRoll  = getAngleDelta(Roll,  lastRoll)  / dt
+                dPitch = getAngleDelta(Pitch, lastPitch) / dt
+                dYaw   = getAngleDelta(Yaw,   lastYaw)   / dt
             end
 
+            -- Physics rates (always read, for comparison)
+            physX, physY, physZ = getPhysicsAngularVelocity(drone)
+
+            if GYRO_MODE == "physics" and physX then
+                X_rot, Y_rot, Z_rot = physX, physY, physZ
+                gyroSource = "physics"
+            elseif dRoll then
+                X_rot, Y_rot, Z_rot = dRoll, dPitch, dYaw
+                gyroSource = "derived"
+            end
+
+            -- ---- Crash detection ----
+            if crashFlag then
+                crashFlag = false
+                registerCrash(now, "collision hit")
+            elseif not hookEverFired and dt and dt > 0 then
+                local decelRate = (lastVelocity - currentSpeed) / dt
+                local angSpike = math.max(math.abs(X_rot), math.abs(Y_rot), math.abs(Z_rot))
+                local is3D = readProp(drone, "IS3D?") == true
+                local confirmed = (not is3D) or angSpike > FALLBACK_ANG_SPIKE_3D
+                if lastVelocity > FALLBACK_MIN_SPEED
+                   and decelRate > FALLBACK_DECEL
+                   and confirmed then
+                    registerCrash(now, string.format("fallback%s: %.0f -> %.0f, decel %.0f/s^2, ang %.0f deg/s",
+                        is3D and " 3D" or "", lastVelocity, currentSpeed, decelRate, angSpike))
+                end
+            end
+
+            lastVelocity = currentSpeed
             lastPitch, lastYaw, lastRoll = Pitch, Yaw, Roll
         end
         detectionLoop()
@@ -68,22 +217,20 @@ local function statusLoop()
             local vel = drone:GetVelocity()
             local speed = math.sqrt(vel.X^2 + vel.Y^2 + vel.Z^2)
 
-            -- Drone Location in XYZ Coordinates
-            local VectorXYZ = drone:K2_GetActorLocation()
-            local X_loc = VectorXYZ.X or 0
-            local Y_loc = VectorXYZ.Y or 0
-            local Z_loc = VectorXYZ.Z or 0
+            local L = drone:K2_GetActorLocation()
+            local R = drone:K2_GetActorRotation()
 
-            -- Pitch Yaw Roll 
-            local VectorRotate = drone:K2_GetActorRotation()
-            local Pitch = VectorRotate.Pitch or 0
-            local Yaw = VectorRotate.Yaw or 0
-            local Roll = VectorRotate.Roll or 0
-            
-            -- Note: X_rot, Y_rot, and Z_rot are now pulled directly from the live 25ms calculations above
+            print(string.format("[TelemetryCrX] Speed: %.2f | LastSpeed: %.2f | X: %.2f | Y: %.2f | Z: %.2f | X_rot: %.2f | Y_rot: %.2f | Z_rot: %.2f | Gyro: %s | Pitch: %.2f | Yaw: %.2f | Roll: %.2f | Crashes: %d | Resets: %d | Hook: %s",
+                speed, lastVelocity, L.X or 0, L.Y or 0, L.Z or 0, X_rot, Y_rot, Z_rot, gyroSource,
+                R.Pitch or 0, R.Yaw or 0, R.Roll or 0,
+                crashCount, resetCount, hookEverFired and "active" or "no hits yet"))
 
-            print(string.format("[TelemetryCrX] Speed: %.2f | LastSpeed: %.2f | X: %.2f | Y: %.2f | Z: %.2f | X_rot: %.2f | Y_rot: %.2f | Z_rot: %.2f | Pitch: %.2f | Yaw: %.2f | Roll: %.2f",
-                speed, lastVelocity, X_loc, Y_loc, Z_loc, X_rot, Y_rot, Z_rot, Pitch, Yaw, Roll))
+            -- Comparison + game state (IS3D?, Armed?, stick inputs)
+            print(string.format("[TelemetryCrX] physGyro: %s | IS3D: %s | Armed: %s | Sticks T/P/R/Y: %s / %s / %s / %s",
+                physX and string.format("%.1f, %.1f, %.1f", physX, physY, physZ) or "n/a",
+                tostring(readProp(drone, "IS3D?")), tostring(readProp(drone, "Armed?")),
+                tostring(readProp(drone, "ThrottleAxis")), tostring(readProp(drone, "PitchAxis")),
+                tostring(readProp(drone, "RollAxis")), tostring(readProp(drone, "YawAxis"))))
         else
             print("[TelemetryCrX] No drone")
         end
