@@ -3,7 +3,7 @@
  Roadmap:
 
 - [x] Create a mod in order to fetch more information out of the game (Speed, X, Y, Z, Pitch, Yaw, Roll, Crash Status)
-- [ ] Decoder for the mod info
+- [x] Decoder for the mod info
 - [ ] Setting up environment for training to begin. (Implementing virtual controllers for ai to use, Core Functions etc..)
 - [ ] Designing the reward system and implementing it.
 - [ ] Switching from Python Decoder to Rust Decoder
