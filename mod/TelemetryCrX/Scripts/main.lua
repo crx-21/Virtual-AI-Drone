@@ -12,6 +12,23 @@ local FALLBACK_ANG_SPIKE_3D = 300    -- deg/s; extra confirmation required ONLY 
                                      -- Set to 0 to disable it and use the plain rule everywhere.
 -- ===============================================================
 
+-- =================== TELEMETRY OUTPUT ==========================
+local TELEMETRY_DIR  = (os.getenv("TEMP") or ".") .. "\\TelemetryCrX"
+local TELEMETRY_FILE = TELEMETRY_DIR .. "\\state.json"
+local telemetryEnabled = true
+
+-- Create output directory (silently succeeds if it already exists)
+os.execute('mkdir "' .. TELEMETRY_DIR .. '" 2>nul')
+
+-- Verify io is available for file writes
+if not io or not io.open then
+    print("[TelemetryCrX] WARNING: 'io' library not available — telemetry file output disabled (console-only mode).")
+    telemetryEnabled = false
+else
+    print("[TelemetryCrX] Telemetry file: " .. TELEMETRY_FILE)
+end
+-- ===============================================================
+
 local BP = "/Game/BASE_FPV_LOUIS/LouisFPV.LouisFPV_C:"
 
 local lastVelocity = 0
@@ -21,6 +38,7 @@ local lastTime = nil
 local X_rot, Y_rot, Z_rot = 0, 0, 0      -- Roll / Pitch / Yaw rates in deg/s (selected by GYRO_MODE)
 local physX, physY, physZ = nil, nil, nil -- raw physics reading, for comparison only
 local gyroSource = "none"
+local telemetrySeq = 0
 
 -- Event state
 local crashFlag = false
@@ -66,10 +84,69 @@ local function getPhysicsAngularVelocity(drone)
 end
 
 local function registerCrash(now, reason)
-    if now - lastCrashTime < CRASH_COOLDOWN then return end
+    if now - lastCrashTime < CRASH_COOLDOWN then return false end
     lastCrashTime = now
     crashCount = crashCount + 1
     print(string.format("[TelemetryCrX] CRASH #%d (%s)", crashCount, reason))
+    return true
+end
+
+-- ---------------------------------------------------------------
+-- Telemetry JSON writer — serialises all drone state into a single
+-- JSON object and writes it to TELEMETRY_FILE.  The Python decoder
+-- reads this file; a sequence number lets it detect stale reads.
+-- ---------------------------------------------------------------
+local function writeTelemetry(drone, speed, vel, loc, rot, crashEv, resetEv)
+    if not telemetryEnabled then return end
+
+    telemetrySeq = telemetrySeq + 1
+
+    local armed = readProp(drone, "Armed?")
+    local is3d  = readProp(drone, "IS3D?")
+    local thr   = readProp(drone, "ThrottleAxis")
+    local pit   = readProp(drone, "PitchAxis")
+    local rol   = readProp(drone, "RollAxis")
+    local yaw   = readProp(drone, "YawAxis")
+
+    local json = string.format(
+        '{' ..
+        '"seq":%d,"t":%.6f,' ..
+        '"speed":%.4f,' ..
+        '"x":%.4f,"y":%.4f,"z":%.4f,' ..
+        '"vx":%.4f,"vy":%.4f,"vz":%.4f,' ..
+        '"pitch":%.4f,"yaw":%.4f,"roll":%.4f,' ..
+        '"gyro_x":%.4f,"gyro_y":%.4f,"gyro_z":%.4f,"gyro_src":"%s",' ..
+        '"crashes":%d,"resets":%d,' ..
+        '"crash_ev":%s,"reset_ev":%s,' ..
+        '"armed":%s,"is_3d":%s,' ..
+        '"throttle":%.4f,"pitch_in":%.4f,"roll_in":%.4f,"yaw_in":%.4f' ..
+        '}',
+        telemetrySeq, os.clock(),
+        speed,
+        loc.X or 0, loc.Y or 0, loc.Z or 0,
+        vel.X or 0, vel.Y or 0, vel.Z or 0,
+        rot.Pitch or 0, rot.Yaw or 0, rot.Roll or 0,
+        X_rot, Y_rot, Z_rot, gyroSource,
+        crashCount, resetCount,
+        crashEv  and "true" or "false",
+        resetEv  and "true" or "false",
+        armed == true and "true" or "false",
+        is3d  == true and "true" or "false",
+        tonumber(thr) or 0, tonumber(pit) or 0,
+        tonumber(rol) or 0, tonumber(yaw) or 0
+    )
+
+    local ok, err = pcall(function()
+        local f = io.open(TELEMETRY_FILE, "w")
+        if f then
+            f:write(json)
+            f:flush()
+            f:close()
+        end
+    end)
+    if not ok then
+        print("[TelemetryCrX] Telemetry write error: " .. tostring(err))
+    end
 end
 
 -- ---------------------------------------------------------------
@@ -131,8 +208,13 @@ local function detectionLoop()
         if drone then
             local now = os.clock()
 
+            -- Track per-tick event flags for telemetry
+            local resetThisTick = false
+            local crashThisTick = false
+
             if resetFlag then
                 resetCount = resetCount + 1
+                resetThisTick = true
                 print(string.format("[TelemetryCrX] RESET #%d (%s)", resetCount, resetFlag))
                 resetFlag = nil
                 crashFlag = false
@@ -188,7 +270,7 @@ local function detectionLoop()
             -- ---- Crash detection ----
             if crashFlag then
                 crashFlag = false
-                registerCrash(now, "collision hit")
+                crashThisTick = registerCrash(now, "collision hit")
             elseif not hookEverFired and dt and dt > 0 then
                 local decelRate = (lastVelocity - currentSpeed) / dt
                 local angSpike = math.max(math.abs(X_rot), math.abs(Y_rot), math.abs(Z_rot))
@@ -197,10 +279,13 @@ local function detectionLoop()
                 if lastVelocity > FALLBACK_MIN_SPEED
                    and decelRate > FALLBACK_DECEL
                    and confirmed then
-                    registerCrash(now, string.format("fallback%s: %.0f -> %.0f, decel %.0f/s^2, ang %.0f deg/s",
+                    crashThisTick = registerCrash(now, string.format("fallback%s: %.0f -> %.0f, decel %.0f/s^2, ang %.0f deg/s",
                         is3D and " 3D" or "", lastVelocity, currentSpeed, decelRate, angSpike))
                 end
             end
+
+            -- Write telemetry state to JSON file for the Python decoder
+            writeTelemetry(drone, currentSpeed, vel, loc, VectorRotate, crashThisTick, resetThisTick)
 
             lastVelocity = currentSpeed
             lastPitch, lastYaw, lastRoll = Pitch, Yaw, Roll
