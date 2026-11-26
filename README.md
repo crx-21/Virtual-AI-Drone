@@ -6,6 +6,7 @@
 - [ ] Decoder for the mod info
 - [ ] Setting up environment for training to begin. (Implementing virtual controllers for ai to use, Core Functions etc..)
 - [ ] Designing the reward system and implementing it.
+- [ ] Switching from Python Decoder to Rust Decoder
 - [ ] Set Milestones.md so that I can keep track AI progress.
 - [ ] Release final trained model to github.
 - [ ] Setup an application so that other people can run this AI in their game and watch it fly.
