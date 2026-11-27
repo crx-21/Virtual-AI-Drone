@@ -151,33 +151,45 @@ end
 
 -- ---------------------------------------------------------------
 -- Hook 1: the game's own collision event (component OnHit bound event on the mesh).
+-- Retries every 1s in case the Blueprint class isn't loaded when the mod starts.
 -- Params: HitComponent, OtherActor, OtherComp, NormalImpulse, Hit
 -- ---------------------------------------------------------------
-local okHit, errHit = pcall(function()
-    RegisterHook(BP .. "BndEvt__Drone_K2Node_ComponentBoundEvent_0_ComponentHitSignature__DelegateSignature",
-        function(self, HitComponent, OtherActor, OtherComp, NormalImpulse, Hit)
-            local ok, err = pcall(function()
-                local imp = NormalImpulse:get()
-                local mag = math.sqrt((imp.X or 0)^2 + (imp.Y or 0)^2 + (imp.Z or 0)^2)
+local lastHitT, lastHitImpulse = -math.huge, 0
 
-                local otherName = "?"
-                pcall(function()
-                    local a = OtherActor:get()
-                    if a and a:IsValid() then otherName = a:GetFullName() end
+local function registerHitHook()
+    local ok = pcall(function()
+        RegisterHook(BP .. "BndEvt__Drone_K2Node_ComponentBoundEvent_0_ComponentHitSignature__DelegateSignature",
+            function(self, HitComponent, OtherActor, OtherComp, NormalImpulse, Hit)
+                local okCb, err = pcall(function()
+                    local i = NormalImpulse:get()
+                    local mag = math.sqrt((i.X or 0)^2 + (i.Y or 0)^2 + (i.Z or 0)^2)
+
+                    lastHitImpulse = mag
+                    lastHitT = os.clock()
+                    hookEverFired = true
+
+                    local otherName = "?"
+                    pcall(function()
+                        local a = OtherActor:get()
+                        if a and a:IsValid() then otherName = a:GetFullName() end
+                    end)
+
+                    print(string.format("[TelemetryCrX] HIT impulse=%.1f (min %.1f) other=%s", mag, HIT_IMPULSE_MIN, otherName))
+
+                    if mag > HIT_IMPULSE_MIN then
+                        crashFlag = true
+                    end
                 end)
-
-                hookEverFired = true
-                print(string.format("[TelemetryCrX] HIT impulse=%.1f (min %.1f) other=%s", mag, HIT_IMPULSE_MIN, otherName))
-
-                if mag > HIT_IMPULSE_MIN then
-                    crashFlag = true
-                end
+                if not okCb then print("[TelemetryCrX] Hit callback error: " .. tostring(err)) end
             end)
-            if not ok then print("[TelemetryCrX] Hit callback error: " .. tostring(err)) end
-        end)
-end)
-print(okHit and "[TelemetryCrX] Hit hook registered"
-      or ("[TelemetryCrX] Hit hook FAILED (fallback only): " .. tostring(errHit)))
+    end)
+    if ok then
+        print("[TelemetryCrX] Hit hook registered")
+    else
+        ExecuteWithDelay(1000, registerHitHook)
+    end
+end
+registerHitHook()
 
 -- ---------------------------------------------------------------
 -- Hook 2: the game's reset functions (marks episode boundaries / teleports)
@@ -294,6 +306,19 @@ local function detectionLoop()
     end)
 end
 
+local function prop(obj, name)
+    local ok, v = pcall(function() return obj[name] end)
+    if ok then return v end
+    return nil
+end
+
+local function fmt(v)
+    if type(v) == "number" then return string.format("%.3f", v) end
+    return tostring(v)
+end
+
+local checkedPhysW = false
+
 -- Status print every second
 local function statusLoop()
     ExecuteWithDelay(1000, function()
@@ -316,6 +341,32 @@ local function statusLoop()
                 tostring(readProp(drone, "IS3D?")), tostring(readProp(drone, "Armed?")),
                 tostring(readProp(drone, "ThrottleAxis")), tostring(readProp(drone, "PitchAxis")),
                 tostring(readProp(drone, "RollAxis")), tostring(readProp(drone, "YawAxis"))))
+
+            print(string.format("[TelemetryCrX] IN thr: %s | pit: %s | rol: %s | yaw: %s | 3D: %s | ACROSel: %s | Armed: %s | MaxAngle: %s | TimeCrashed: %s | Reset: %s | FullReset: %s | RecentReset: %s",
+                fmt(prop(drone, "ThrottleAxis")), fmt(prop(drone, "PitchAxis")),
+                fmt(prop(drone, "RollAxis")), fmt(prop(drone, "YawAxis")),
+                fmt(prop(drone, "IS3D?")), fmt(prop(drone, "ACROSelection")),
+                fmt(prop(drone, "Armed?")), fmt(prop(drone, "MaxAngle")),
+                fmt(prop(drone, "time crashed")), fmt(prop(drone, "Reset")),
+                fmt(prop(drone, "FullReset")), fmt(prop(drone, "recent_Reset"))))
+
+            -- one-off physics check on RootComponent
+            if not checkedPhysW then
+                checkedPhysW = true
+                local rc = drone.RootComponent
+                if rc and rc:IsValid() and rc:IsA("/Script/Engine.PrimitiveComponent") then
+                    local okW, w = pcall(function()
+                        return rc:GetPhysicsAngularVelocityInDegrees(FName("None"))
+                    end)
+                    print("[TelemetryCrX] physW:", okW, okW and w and string.format("%.1f %.1f %.1f", w.X, w.Y, w.Z) or tostring(w))
+                else
+                    local rcClass = "nil"
+                    if rc and rc:IsValid() then
+                        pcall(function() rcClass = rc:GetClass():GetFullName() end)
+                    end
+                    print("[TelemetryCrX] physW: RootComponent is not a PrimitiveComponent (" .. rcClass .. ")")
+                end
+            end
         else
             print("[TelemetryCrX] No drone")
         end
